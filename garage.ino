@@ -1,218 +1,218 @@
+// garage.ino – migrated to jvlib (ESP8266 D1 mini)
+// Door state + relay + BME + DHT + OneWire
+// Air sensors: 2 min  |  Door: on change + 10 min retained heartbeat
+
+#define mainver "0.03"
 #define me "GD01"
-#define ONE
+#define LOG_LEVEL LOG_INFO
+
+// Sensors
 #define BME
-#define DHT
-#define DHTpin D3
-#define OneWpin D5
+#define DHTPIN D3
+#define OW_PIN1 D5
 #define i2cdata D6
 #define i2cclock D7
-#include <jvcommon.h>
 
-const char* xformat = "%02X%02X%02X%02X%02X%02X%02X%02X";
+// BME SLP – ~6 m below SN02 (133 m)
+#define JV_ALTITUDE_M 127.0
+#define JV_BME_PRES_BIAS 0.0
 
-String version = "0.02b2";
-// 08/16/2021 version 0.01b1 begin tracking -complete code reorg and cleanup
-// 08/20/2021 version 0.01b2 added sensor based conditional build #defines and logic
-// 08/21/2021 version 0.01b3 fixed MQTT buffersize too small issue
-// 08/21/2021 version 0.01b4 add IP address to MQTT message
-// 08/21/2021 version 0.01b5 remote enable/disable OTA listen
-// 05/13/2024 version 0.01b6 change IP of broker and add 3 digit preecision
-// 07/22/2024 version 0.02b1 fix json prob,remove OTA crap & complete cleanup
-// 09/07/2024 version 0.02b2 move common modules to separate header file/reorg code
+#define MQTT_PUBLISH_TOPIC "garage/SN01"   // environmental (non-retain)
 
-const char* name;
-char msg[400];
-int sensorVal, sensorOld = 0, loopcount = 0;
+#include <jvlib.h>
+#include <ArduinoJson.h>
 
-// task manager variables
-unsigned long t1old = 0, t1interval = 120 * 1000;  // Publish door state once every 120 seconds
-unsigned long t2old = 0, t2interval = 500;         // read door state every 500 ms
-unsigned long t3old = 0, t3interval = 1000;        // check for incoming every 1000 ms
-unsigned long t4old = 0, t4interval = 60 * 1000;   // read DHT every 1 min
-unsigned long t5old = 0, t5interval = 60 * 1000;   // read onewire evert 1 minute
-unsigned long t6old = 0, t6interval = 125 * 1000;  // publish garage readings every 2 minutes
-unsigned long t7old = 0, t7interval = 60 * 1000;   // read BME every 1 min
+// ---------------------------------------------------------------------------
+// Door / relay hardware
+// ---------------------------------------------------------------------------
+static const int PIN_RELAY = D1;
+static const int PIN_REED  = D2;
 
-void callback(char* topic, byte* payload, unsigned int length) {
-  Serial.print("Message arrived [");
-  Serial.print(topic);
-  Serial.print("] len = ");
-  Serial.println(length);
-  for (int i = 0; i < length; i++) {
-    Serial.print((char)payload[i]);
+static const unsigned long RELAY_PULSE_MS     = 1000;
+static const unsigned long DOOR_SAMPLE_MS    = 250;
+static const unsigned long DOOR_DEBOUNCE_MS  = 40;
+static const unsigned long DOOR_HEARTBEAT_MS = 10UL * 60UL * 1000UL;  // 10 min
+static const unsigned long AIR_CYCLE_MS      = 2UL * 60UL * 1000UL;   // 2 min network-wide
+
+static int doorRaw = HIGH;           // INPUT_PULLUP: HIGH = open circuit
+static int doorStable = HIGH;
+static int doorPublished = -1;       // last value sent to MQTT
+static unsigned long doorLastChangeMs = 0;
+static unsigned long doorLastPubMs = 0;
+static unsigned long relayBusyUntil = 0;
+
+// Old sketch published sensorVal+1 (1 or 2). Keep for Influx compatibility.
+static int doorStateCode() {
+  // reed with pullup: LOW = magnet present (closed), HIGH = open — verify on your wiring
+  // Matching old: digitalRead value used as 0/1 then +1 → 1 or 2
+  return (doorStable == LOW) ? 1 : 2;   // adjust if your open/closed is inverted
+}
+
+static void pulseRelay() {
+  if (millis() < relayBusyUntil) {
+    LOG_INFO("Relay busy, ignore activate");
+    return;
   }
-  Serial.println("");
-  payload[length] = 0;
-  doc.clear();
-  deserializeJson(doc, payload);
-  name = doc["name"];
-  if (strcmp(name, "GD02") == 0) {
-    name = doc["activate"];
-    if (strcmp(name, "YES") == 0) {
-      digitalWrite(D1, HIGH);
-      delay(1000);
-      digitalWrite(D1, LOW);
-    }
+  LOG_INFO("Door activate pulse %lu ms", RELAY_PULSE_MS);
+  digitalWrite(PIN_RELAY, HIGH);
+  delay(RELAY_PULSE_MS);
+  digitalWrite(PIN_RELAY, LOW);
+  relayBusyUntil = millis() + RELAY_PULSE_MS + 500;
+}
+
+static void publishDoor(bool forceRetainHeartbeat) {
+  StaticJsonDocument<256> doc;
+  doc["name"] = me;
+  doc["id"] = jv::deviceId();
+  doc["01DoorState"] = doorStateCode();
+  doc["IP"] = jv::ip();
+  doc["Ver"] = jv::version();
+
+  char buf[256];
+  serializeJson(doc, buf, sizeof(buf));
+  bool ok = jv::publishRaw("garage/GD01", buf, true);  // always retain door state
+  LOG_INFO("Door publish state=%d retain → %s", doorStateCode(), ok ? "OK" : "FAIL");
+  doorPublished = doorStateCode();
+  doorLastPubMs = millis();
+  (void)forceRetainHeartbeat;
+}
+
+static void serviceDoor() {
+  static unsigned long lastSample = 0;
+  unsigned long now = millis();
+  if (now - lastSample < DOOR_SAMPLE_MS) return;
+  lastSample = now;
+
+  int raw = digitalRead(PIN_REED);
+  if (raw != doorRaw) {
+    doorRaw = raw;
+    doorLastChangeMs = now;
+  }
+  if ((now - doorLastChangeMs) >= DOOR_DEBOUNCE_MS && doorStable != doorRaw) {
+    doorStable = doorRaw;
+    LOG_INFO("Door changed → code %d", doorStateCode());
+    publishDoor(false);
+  }
+
+  if (now - doorLastPubMs >= DOOR_HEARTBEAT_MS) {
+    publishDoor(true);
   }
 }
 
-void reconnect() {
-  if (WiFi.status() != WL_CONNECTED) { JVWIFISetUp(); }
-  // Loop until we're reconnected
-  client.setBufferSize(512);
-  client.setServer(mqtt_server, 1883);
-  client.setCallback(callback);
-  while (!client.connected()) {
-    Serial.print("Attempting MQTT connection...");
-    // Attempt to connect
-    if (client.connect("GD01Client", "admin", "rebels1")) {
-      Serial.println("connected");
-      client.subscribe("garage/GD02");
-      Serial.println("Subscribed");
-    } else {
-      Serial.print("failed, rc=");
-      Serial.print(client.state());
-      Serial.println(" try again in 5 seconds");
-      // Wait 5 seconds before retrying
-      delay(5000);
-    }
+// ---------------------------------------------------------------------------
+// MQTT command: garage/GD02  {"name":"GD02","activate":"YES"}
+// ---------------------------------------------------------------------------
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+  if (strcmp(topic, "garage/GD02") != 0) return;
+
+  StaticJsonDocument<256> doc;
+  if (deserializeJson(doc, payload, length)) {
+    LOG_WARN("GD02 JSON parse failed");
+    return;
+  }
+
+  const char* n = doc["name"] | "";
+  const char* act = doc["activate"] | "";
+  if (strcmp(n, "GD02") == 0 && strcmp(act, "YES") == 0) {
+    pulseRelay();
+    // optional: re-publish door state after pulse
+    delay(50);
+    serviceDoor();
   }
 }
 
-void pubdoor() {
-  reconnect();
-  doc.clear();
-  doc["name"] = hostname;  // Begin to build the JSON for MQTT
-  client.setCallback(callback);
-  doc["01DoorState"] = sensorVal + 1;
-  serializeJson(doc, msg);
-  client.publish("garage/GD01", msg);
+// ---------------------------------------------------------------------------
+// Environmental publish – classic SN01 keys, 2 min, no retain
+// ---------------------------------------------------------------------------
+void publishAir() {
+  jv::readSensors();
+
+  StaticJsonDocument<2048> doc;
+  doc["name"] = "SN01";
+  doc["id"]   = jv::deviceId();
+
+#if OW_PIN1 >= 0
+  for (int i = 0; i < publishedSensorCount; i++) {
+    if (!isnan(publishedTemps[i])) {
+      char key[20];
+      sprintf(key, "%02X%02X%02X%02X%02X%02X%02X%02X",
+              publishedAddrs[i][0], publishedAddrs[i][1],
+              publishedAddrs[i][2], publishedAddrs[i][3],
+              publishedAddrs[i][4], publishedAddrs[i][5],
+              publishedAddrs[i][6], publishedAddrs[i][7]);
+      doc[key] = publishedTemps[i];
+    }
+  }
+#endif
+
+#ifdef BME
+  if (bmetemp > -900.0) {
+    doc["01bmet"]  = bmetemp;
+    doc["01bmeh"]  = bmehum;
+    doc["01bmep"]  = bmepres;
+    doc["01bmed"]  = bmedew;
+    doc["01bmehi"] = bmehi;
+    // also the short keys some flows used
+    doc["01temp"]     = bmetemp;
+    doc["01humidity"] = bmehum;
+    doc["01pressure"] = bmepres;
+    doc["01dewpoint"] = bmedew;
+  }
+#endif
+
+#if DHTPIN >= 0
+  if (dhttemp > -900.0) {
+    doc["01dhtt"]  = dhttemp;
+    doc["01dhth"]  = dhthum;
+    doc["01dhtd"]  = dhtdew;
+    doc["01dhthi"] = dhthi;
+  }
+#endif
+
+  doc["IP"]   = jv::ip();
+  doc["RSSI"] = jv::rssi();
+  doc["Ver"]  = jv::version();
+
+  char buf[1536];
+  serializeJson(doc, buf, sizeof(buf));
+  bool ok = jv::publishRaw("garage/SN01", buf, false);
+  LOG_INFO("Air publish → %s", ok ? "OK" : "FAIL");
   serializeJsonPretty(doc, Serial);
   Serial.println();
-  Serial.flush();
-  doc.clear();
-  client.subscribe("garage/GD02");
 }
 
-void readpin() {
-  sensorVal = digitalRead(D2);
-  if (sensorVal != sensorOld) {
-    sensorOld = sensorVal;
-    loopcount = 1000;
-  }
-  if (loopcount > 120) {
-    pubdoor();
-    loopcount = 0;
-  }
-  loopcount++;
-}
+// ---------------------------------------------------------------------------
+void setup() {
+  pinMode(PIN_RELAY, OUTPUT);
+  digitalWrite(PIN_RELAY, LOW);
+  pinMode(PIN_REED, INPUT_PULLUP);
 
-void pubth() {                          // publish data to MQTT
-  if (WiFi.status() != WL_CONNECTED) {  // reconnect WiFi if necessary
-    JVWIFISetUp();
-  }
-  String clientId = hostname;
-  clientId += String(random(0xffff), HEX);
-  while (!client.connected()) {
-    Serial.println("MQTT connecting");
-    // Try to connect
-    if (client.connect(clientId.c_str(), mqttID, mqttPASS)) {
-      client.setBufferSize(500);
-    } else {
-      delay(2000);
-    }
-  }
-  Serial.print("MQTT connected. ClientId: ");
-  Serial.println(clientId.c_str());
+  jv::begin();
+  jvSensorsBegin();
+  jv::setCallback(mqttCallback);
+  jv::subscribe("garage/GD02");
+  jvWatchdogSetup();
+  jvDailyRebootSetup();
 
-  doc.clear();
-  doc["name"] = "SN01";  // Begin to build the JSON for MQTT
-  double thi = -999.9;
-  double dew = -999.9;
-  double rh = 0;
-  double baro = 0;
-  dew = dhtdew;
-  thi = dhttemp;
-  rh = dhthum;
-  double heatindex = feels(thi, rh);
-  if (thi > -999.9) {
-    thi = round(thi);
-    doc["01temp"] = thi;
-    doc["01humidity"] = rh;
-  }
-  if (rh >= 30.0 && thi >= 70.0) {
-    doc["01heatindex"] = heatindex;
-  }
-  if (baro > 0.0) { doc["01pressure"] = baro; }
-  if (dew > -999.9) { doc["01dewpoint"] = dew; }
+  doorRaw = doorStable = digitalRead(PIN_REED);
+  LOG_INFO("Garage GD01/SN01 starting (alt %.1f m)", (double)JV_ALTITUDE_M);
 
-  for (int i = 0; i < sensors; i++) {
-    sprintf(msg, xformat, tsn[i][0], tsn[i][1], tsn[i][2], tsn[i][3], tsn[i][4], tsn[i][5], tsn[i][6], tsn[i][7]);
-    doc[msg] = t[i];
-  }
-  doc["IP"] = myip;
-  doc["01bmet"] = bmetemp;
-  doc["01bmeh"] = bmehum;
-  doc["01bmep"] = bmepres;
-  doc["01bmed"] = bmedew;
-  doc["01bmehi"] = bmehi;
-  doc["01dhtt"] = dhttemp;
-  doc["01dhth"] = dhthum;
-  doc["01dhtd"] = dhtdew;
-  doc["01dhthi"] = dhthi;
-  doc["RSSI"] = rssi;
-  doc["Ver"] = version;
-  serializeJson(doc, msg);
-  bool rc = client.publish("garage/SN01", msg);
-
-  serializeJsonPretty(doc, Serial);
-  Serial.println();
-  Serial.flush();
-  doc.clear();
-  client.disconnect();
-  return;
+  publishDoor(true);
+  publishAir();
 }
 
 void loop() {
-  Wire.begin(); /* data, clock */
-  reconnect();
-  pinMode(D1, OUTPUT);
-  pinMode(D2, INPUT_PULLUP);
-  readdht();
-  readbme();
-  readone();
-  readpin();
-  pubth();
-  while (1 == 1) {
-    if ((unsigned long)(millis() - t2old) >= t2interval) {
-      t2old = millis();
-      readpin();
-    }
-    if ((unsigned long)(millis() - t3old) >= t3interval) {
-      t3old = millis();
-      reconnect();
-      client.loop();
-    }
-    if ((unsigned long)(millis() - t1old) >= t1interval) {
-      t1old = millis();
-      pubdoor();
-    }
-    if ((unsigned long)(millis() - t4old) >= t4interval) {
-      t4old = millis();
-      readdht();
-    }
-    if ((unsigned long)(millis() - t5old) >= t5interval) {
-      t5old = millis();
-      readone();
-    }
-    if ((unsigned long)(millis() - t6old) >= t6interval) {
-      t6old = millis();
-      pubth();
-    }
-    if ((unsigned long)(millis() - t7old) >= t7interval) {
-      t7old = millis();
-      readbme();
-    }
-    delay(50);
+  jv::loop();
+  jvWatchdogFeed();
+  jvCheckDailyReboot();
+  serviceDoor();
+
+  static unsigned long lastAir = 0;
+  if (millis() - lastAir >= AIR_CYCLE_MS) {
+    lastAir = millis();
+    LOG_INFO("Air measurement cycle");
+    publishAir();
   }
+
+  delay(10);
 }
