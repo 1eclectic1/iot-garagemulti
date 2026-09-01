@@ -1,51 +1,41 @@
-// garage.ino – migrated to jvlib (ESP8266 D1 mini)
-// Door state + relay + BME + DHT + OneWire
-// Air sensors: 2 min  |  Door: on change + 10 min retained heartbeat
+// garage.ino – jvlib (ESP8266 D1 mini)
+// Door + relay + DHT + OneWire  (BME removed – hardware dead)
+// Air: 2 min  |  Door: on change + 10 min retained heartbeat
 
-#define mainver "0.03"
+#define mainver "0.04"
 #define me "GD01"
 #define LOG_LEVEL LOG_INFO
 
-// Sensors
-#define BME
+// Sensors (no BME)
 #define DHTPIN D3
 #define OW_PIN1 D5
 #define i2cdata D6
 #define i2cclock D7
 
-// BME SLP – ~6 m below SN02 (133 m)
-#define JV_ALTITUDE_M 127.0
-#define JV_BME_PRES_BIAS 0.0
-
-#define MQTT_PUBLISH_TOPIC "garage/SN01"   // environmental (non-retain)
+#define MQTT_PUBLISH_TOPIC "garage/SN01"
 
 #include <jvlib.h>
 #include <ArduinoJson.h>
 
-// ---------------------------------------------------------------------------
-// Door / relay hardware
-// ---------------------------------------------------------------------------
 static const int PIN_RELAY = D1;
 static const int PIN_REED  = D2;
 
 static const unsigned long RELAY_PULSE_MS     = 1000;
 static const unsigned long DOOR_SAMPLE_MS    = 250;
 static const unsigned long DOOR_DEBOUNCE_MS  = 40;
-static const unsigned long DOOR_HEARTBEAT_MS = 10UL * 60UL * 1000UL;  // 10 min
-static const unsigned long AIR_CYCLE_MS      = 2UL * 60UL * 1000UL;   // 2 min network-wide
+static const unsigned long DOOR_HEARTBEAT_MS = 10UL * 60UL * 1000UL;
+static const unsigned long AIR_CYCLE_MS      = 2UL * 60UL * 1000UL;
 
-static int doorRaw = HIGH;           // INPUT_PULLUP: HIGH = open circuit
+static int doorRaw = HIGH;
 static int doorStable = HIGH;
-static int doorPublished = -1;       // last value sent to MQTT
+static int doorPublished = -1;
 static unsigned long doorLastChangeMs = 0;
 static unsigned long doorLastPubMs = 0;
 static unsigned long relayBusyUntil = 0;
 
-// Old sketch published sensorVal+1 (1 or 2). Keep for Influx compatibility.
 static int doorStateCode() {
-  // reed with pullup: LOW = magnet present (closed), HIGH = open — verify on your wiring
-  // Matching old: digitalRead value used as 0/1 then +1 → 1 or 2
-  return (doorStable == LOW) ? 1 : 2;   // adjust if your open/closed is inverted
+  // INPUT_PULLUP: LOW = closed (magnet), HIGH = open — flip if inverted
+  return (doorStable == LOW) ? 1 : 2;
 }
 
 static void pulseRelay() {
@@ -60,7 +50,7 @@ static void pulseRelay() {
   relayBusyUntil = millis() + RELAY_PULSE_MS + 500;
 }
 
-static void publishDoor(bool forceRetainHeartbeat) {
+static void publishDoor(bool /*heartbeat*/) {
   StaticJsonDocument<256> doc;
   doc["name"] = me;
   doc["id"] = jv::deviceId();
@@ -70,11 +60,10 @@ static void publishDoor(bool forceRetainHeartbeat) {
 
   char buf[256];
   serializeJson(doc, buf, sizeof(buf));
-  bool ok = jv::publishRaw("garage/GD01", buf, true);  // always retain door state
-  LOG_INFO("Door publish state=%d retain → %s", doorStateCode(), ok ? "OK" : "FAIL");
+  bool ok = jv::publishRaw("garage/GD01", buf, true);
+  LOG_INFO("Door publish state=%d → %s", doorStateCode(), ok ? "OK" : "FAIL");
   doorPublished = doorStateCode();
   doorLastPubMs = millis();
-  (void)forceRetainHeartbeat;
 }
 
 static void serviceDoor() {
@@ -99,9 +88,6 @@ static void serviceDoor() {
   }
 }
 
-// ---------------------------------------------------------------------------
-// MQTT command: garage/GD02  {"name":"GD02","activate":"YES"}
-// ---------------------------------------------------------------------------
 void mqttCallback(char* topic, byte* payload, unsigned int length) {
   if (strcmp(topic, "garage/GD02") != 0) return;
 
@@ -115,15 +101,11 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   const char* act = doc["activate"] | "";
   if (strcmp(n, "GD02") == 0 && strcmp(act, "YES") == 0) {
     pulseRelay();
-    // optional: re-publish door state after pulse
     delay(50);
     serviceDoor();
   }
 }
 
-// ---------------------------------------------------------------------------
-// Environmental publish – classic SN01 keys, 2 min, no retain
-// ---------------------------------------------------------------------------
 void publishAir() {
   jv::readSensors();
 
@@ -145,27 +127,19 @@ void publishAir() {
   }
 #endif
 
-#ifdef BME
-  if (bmetemp > -900.0) {
-    doc["01bmet"]  = bmetemp;
-    doc["01bmeh"]  = bmehum;
-    doc["01bmep"]  = bmepres;
-    doc["01bmed"]  = bmedew;
-    doc["01bmehi"] = bmehi;
-    // also the short keys some flows used
-    doc["01temp"]     = bmetemp;
-    doc["01humidity"] = bmehum;
-    doc["01pressure"] = bmepres;
-    doc["01dewpoint"] = bmedew;
-  }
-#endif
-
+  // Primary garage air keys from DHT (BME removed)
 #if DHTPIN >= 0
   if (dhttemp > -900.0) {
-    doc["01dhtt"]  = dhttemp;
-    doc["01dhth"]  = dhthum;
-    doc["01dhtd"]  = dhtdew;
-    doc["01dhthi"] = dhthi;
+    doc["01temp"]     = dhttemp;
+    doc["01humidity"] = dhthum;
+    doc["01dewpoint"] = dhtdew;
+    doc["01dhtt"]     = dhttemp;
+    doc["01dhth"]     = dhthum;
+    doc["01dhtd"]     = dhtdew;
+    doc["01dhthi"]    = dhthi;
+    if (dhthi > -900.0 && dhthum >= 30.0 && dhttemp >= 70.0) {
+      doc["01heatindex"] = dhthi;
+    }
   }
 #endif
 
@@ -181,7 +155,6 @@ void publishAir() {
   Serial.println();
 }
 
-// ---------------------------------------------------------------------------
 void setup() {
   pinMode(PIN_RELAY, OUTPUT);
   digitalWrite(PIN_RELAY, LOW);
@@ -195,7 +168,7 @@ void setup() {
   jvDailyRebootSetup();
 
   doorRaw = doorStable = digitalRead(PIN_REED);
-  LOG_INFO("Garage GD01/SN01 starting (alt %.1f m)", (double)JV_ALTITUDE_M);
+  LOG_INFO("Garage GD01/SN01 starting (DHT+OW, no BME)");
 
   publishDoor(true);
   publishAir();
